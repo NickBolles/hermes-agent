@@ -3557,6 +3557,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if limit <= 0:
             return None
         inflight = self.active_agent_work_count()
+        # Queued structured runs remain in the drain inventory but are not
+        # executing. Other API surfaces must not jump ahead of the FIFO.
+        queue = getattr(self, "_run_queue", None)
+        if queue and queue.waiting:
+            return _error_response("Agent runs are queued; retry shortly", 429,
+                                   code="rate_limit_exceeded", headers={"Retry-After": "1"})
         # The current request's own reservation must not consume its last available slot.
         reservation = _api_agent_request_reservation.get()
         if reservation and reservation["active"]:
@@ -3879,7 +3885,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: web.Request) -> web.Response:
-        return await _api_runs._handle_runs(self, request, _api_server=sys.modules[__name__])
+        # Serialize the short admission path, not execution. Session/history
+        # awaits must not let concurrent requests claim the same last slot.
+        async with self._run_admission_lock:
+            return await _api_runs._handle_runs(self, request, _api_server=sys.modules[__name__])
 
     def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
         return _api_runs._request_owns_run(self, request, run_id)

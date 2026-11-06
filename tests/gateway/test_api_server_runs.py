@@ -249,7 +249,7 @@ class TestStartRun:
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert resp.status == 202
                 data = await resp.json()
-                assert data["status"] == "started"
+                assert data["status"] == "queued"
                 assert data["run_id"].startswith("run_")
 
                 status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
@@ -1554,12 +1554,9 @@ class TestRunIdempotency:
         _use_idempotency_db(adapter, tmp_path / "idem.db")
         app = _create_runs_app(adapter)
         with patch.object(
-            adapter,
-            "_concurrency_limited_response",
-            side_effect=[
-                web.json_response({"error": "full"}, status=429),
-                None,
-            ],
+            adapter._run_queue,
+            "reserve",
+            side_effect=[False, True],
         ):
             async with TestClient(TestServer(app)) as cli:
                 headers = {"Idempotency-Key": "capacity-retry"}
