@@ -937,8 +937,11 @@ async def _execute_queued_run(self, launch, selected_session_id, *, _api_server)
     def cancelled():
         return run_id in self._stopping_run_ids or run_id in self._shutdown_interrupted_run_ids
     def available():
+        waiting_work = sum(
+            not task.done() for queued_id in self._run_queue.waiting
+            if (task := self._active_run_tasks.get(queued_id)) is not None)
         return (self._max_concurrent_runs <= 0 or
-                self.active_agent_work_count() - len(self._run_queue.waiting) < self._max_concurrent_runs)
+                self.active_agent_work_count() - waiting_work < self._max_concurrent_runs)
     try:
         if not available():
             launch.put_event(_run_event(run_id, "run.queued", message="Queued — waiting for an available agent slot"))
