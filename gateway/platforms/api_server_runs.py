@@ -258,6 +258,9 @@ def _uses_room_run_auth(self, request: web.Request) -> bool:
 
 def _initialize_run_state(self, *, store_factory) -> None:
     """Initialize adapter-owned durable and live ``/v1/runs`` state."""
+    from gateway.platforms.api_run_queue import RunQueue
+    self._run_queue = RunQueue(capacity=100)
+    self._run_admission_lock = asyncio.Lock()
     self._run_idempotency_store = store_factory()
     self._run_owner_pid = os.getpid()
     try:
@@ -731,6 +734,7 @@ def _run_user_message(raw_input, _openai_error) -> tuple:
 async def _admit_run_to_authority(
     self, launch, run_id, session_history_delivery, _declared_selected,
     idempotency_scope, idempotency_key, _openai_error,
+    *, retain_on_refusal=False,
 ) -> Optional[web.Response]:
     """Admit a /v1/runs turn to the session authority FIFO -> ``None``, or the refusal."""
     from gateway.platforms.api_server_authority_runs import run_admission, store_error_response
@@ -754,6 +758,9 @@ async def _admit_run_to_authority(
         if owned is not None:
             launch.admission = (owned[0], SessionRef(owned[0].profile_id, owned[1]['target_session_id']), owned[1])
             return None
+        if retain_on_refusal:
+            # Already accepted: keep failed status and idempotency replayable.
+            return store_error_response(_openai_error, exc)
         # A refused admission owns no run: drop every reservation so an exact
         # retry is refused again instead of replaying a run nobody executes.
         _forget_run(
@@ -820,10 +827,11 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             retention_until=_room_retention_until(request))
         if outcome == "conflict" or (outcome == "reused" and record is not None):
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
-    # Enforce concurrency only for a genuinely new run.
-    limited = self._concurrency_limited_response()
-    if limited is not None:
-        return limited
+
+    authority = getattr(self.gateway_runner, 'session_authority', None) is not None
+    # Preserve durable-before-accept when capacity is free. Saturated requests
+    # first own a process-local queue entry, not a canonical session admission.
+    authority_immediate = authority and self._concurrency_limited_response() is None
     run_id = f"run_{uuid.uuid4().hex}"
     self._run_owners[run_id] = self._run_idempotency_scope(request)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
@@ -850,17 +858,28 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     session_history_delivery = not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
+    if not authority_immediate and not self._run_queue.reserve(run_id):
+        self._run_owners.pop(run_id, None)
+        return _json_error(_openai_error, "Run queue is full (max 100 waiting runs)",
+                           code="run_queue_full", status=429)
     q = self._run_streams[run_id] = _RunStream()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
         run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
     if idempotency_key:
-        outcome, record = self._run_idempotency_store.reserve(
-            idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
-            owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
-            retention_until=_room_retention_until(request))
+        try:
+            outcome, record = self._run_idempotency_store.reserve(
+                idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
+                owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
+                retention_until=_room_retention_until(request))
+        except Exception:
+            self._run_queue.discard(run_id)
+            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
+                        self._run_approval_sessions, self._run_statuses, self._run_owners)
+            raise
         if outcome != "created":
+            self._run_queue.discard(run_id)
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
                 self._run_statuses, self._run_owners)
@@ -880,25 +899,85 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
     # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
     # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
-    _retarget_to_delivered_chat(self, launch, admitted)
-    if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
-        refused = await _admit_run_to_authority(
-            self, launch, run_id, session_history_delivery, _declared_selected,
-            idempotency_scope, idempotency_key, _openai_error)
-        if refused is not None:
-            return refused
-    self._activate_admitted_request()
-    if admitted is not None:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(
-            _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
+    if authority_immediate:
+        admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
+        _retarget_to_delivered_chat(self, launch, admitted)
+        if admitted is None:
+            refused = await _admit_run_to_authority(
+                self, launch, run_id, session_history_delivery, _declared_selected,
+                idempotency_scope, idempotency_key, _openai_error)
+            if refused is not None:
+                return refused
+        coroutine = (_execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server)
+                     if admitted is not None else _execute_run(self, launch, _api_server=_api_server))
     else:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+        coroutine = _execute_queued_run(self, launch, selected_session_id, _api_server=_api_server)
+    self._activate_admitted_request()
+    task = self._active_run_tasks[run_id] = asyncio.create_task(coroutine)
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+        def release_unstarted(done):
+            # Cancellation before the coroutine's first tick skips its finally.
+            if done.cancelled() and run_id in self._run_queue.waiting:
+                self._run_queue.discard(run_id)
+                self._set_run_status(run_id, "interrupted", error="Gateway stopped before queued run started")
+                launch.put_event(_run_event(run_id, "run.interrupted"))
+                launch.put_event(None)
+                _retire_live_run(self, run_id)
+        task.add_done_callback(release_unstarted)
+    return _accepted_response(run_id, "started" if authority_immediate else "queued", gateway_session_key, replayed=False)
+
+
+async def _execute_queued_run(self, launch, selected_session_id, *, _api_server):
+    """Wait without constructing an agent or admitting a session-authority turn."""
+    run_id = launch.run_id
+    handed_off = False
+    def cancelled():
+        return run_id in self._stopping_run_ids or run_id in self._shutdown_interrupted_run_ids
+    def available():
+        waiting_work = sum(
+            not task.done() for queued_id in self._run_queue.waiting
+            if (task := self._active_run_tasks.get(queued_id)) is not None)
+        return (self._max_concurrent_runs <= 0 or
+                self.active_agent_work_count() - waiting_work < self._max_concurrent_runs)
+    try:
+        if not available():
+            launch.put_event(_run_event(run_id, "run.queued", message="Queued — waiting for an available agent slot"))
+        if not await self._run_queue.acquire(run_id, available, cancelled):
+            status = "interrupted" if run_id in self._shutdown_interrupted_run_ids else "cancelled"
+            self._set_run_status(run_id, status, last_event=f"run.{status}")
+            launch.put_event(_run_event(run_id, f"run.{status}"))
+            return
+        admitted = await self._admit_to_live_bot_chat(
+            launch.session_id, launch.user_message, launch.turn_author) if selected_session_id else None
+        _retarget_to_delivered_chat(self, launch, admitted)
+        if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
+            refused = await _admit_run_to_authority(
+                self, launch, run_id, launch.session_history_delivery, launch.declared_selected,
+                None, None, _api_server._openai_error, retain_on_refusal=True)
+            if refused is not None:
+                raise RuntimeError("Session authority refused queued run admission")
+        if admitted is not None:
+            handed_off = True
+            await _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server)
+        else:
+            handed_off = True
+            await _execute_run(self, launch, _api_server=_api_server)
+    except asyncio.CancelledError:
+        if not handed_off:
+            self._set_run_status(run_id, "interrupted", error="Gateway stopped before run completed")
+        raise
+    except Exception as exc:
+        handed_off = False
+        self._set_run_status(run_id, "failed", error=_api_server._redact_api_error_text(exc))
+        launch.put_event(_run_event(run_id, "run.failed", message="Queued run could not start"))
+    finally:
+        self._run_queue.discard(run_id)
+        if not handed_off:
+            asyncio.get_running_loop().call_soon(launch.put_event, None)
+            _retire_live_run(self, run_id)
 
 
 def _retarget_to_delivered_chat(self, launch: _RunLaunch, admitted) -> None:
@@ -1503,6 +1582,10 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
         return err
     # A run whose turn a live Bot Chat owns (``_execute_run_via_live_owner``) is not an API
     # admission: its stop is the legacy in-process task cancel below, never ``stop_run``.
+    if run_id in self._run_queue.waiting:
+        self._stopping_run_ids.add(run_id)
+        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        return web.json_response({"run_id": run_id, "status": "stopping"})
     if (getattr(self.gateway_runner, 'session_authority', None) is not None
             and not (task is not None and status.get("delivery_id"))):
         from gateway.platforms.api_server_authority_runs import stop_run, store_error_response
